@@ -1,135 +1,125 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+trap 'echo "[ERROR] k9s installation failed (line $LINENO)" >&2; exit 1' ERR
+
 REPO="derailed/k9s"
-OS="linux"
 
-need() { command -v "$1" >/dev/null 2>&1; }
-
-fetch() {
-  local url="$1"
-  if need curl; then curl -fsSL "$url"
-  else wget -qO- "$url"
-  fi
-}
-
-download_to() {
-  local url="$1" out="$2"
-  if need curl; then curl -fL "$url" -o "$out"
-  else wget -q "$url" -O "$out"
-  fi
-}
-
-# ---- prerequisites ----
-if ! need curl && ! need wget; then
-  echo "ERROR: curl or wget is required." >&2
-  exit 1
-fi
-
-# ---- arch detect ----
+# ---- Detect architecture ----
 ARCH="$(uname -m)"
 case "$ARCH" in
-  x86_64|amd64)   ARCH="amd64" ;;
-  aarch64|arm64)  ARCH="arm64" ;;
-  armv7l|armv7|armv6l|armv6) ARCH="arm" ;;
-  *) echo "ERROR: Unsupported arch: $ARCH" >&2; exit 1 ;;
+  x86_64|amd64)   K9S_ARCH="amd64" ;;
+  aarch64|arm64)  K9S_ARCH="arm64" ;;
+  armv7l|armv7)   K9S_ARCH="arm" ;;
+  *)
+    echo "[ERROR] Unsupported architecture: $ARCH" >&2
+    exit 1
+    ;;
 esac
 
-# ---- choose pkg type by system ----
-PKG=""
-if need dnf || need yum || need zypper || need rpm; then
-  PKG="rpm"
-elif need apt-get || need dpkg; then
-  PKG="deb"
+# ---- Detect OS ----
+OS="$(uname -s)"
+case "$OS" in
+  Linux)  K9S_OS="linux" ;;
+  Darwin) K9S_OS="darwin" ;;
+  *)
+    echo "[ERROR] Unsupported OS: $OS" >&2
+    exit 1
+    ;;
+esac
+
+# ---- Requirements (minimal) ----
+for cmd in curl tar grep sudo install uname mktemp; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "[ERROR] Missing required command: $cmd" >&2; exit 1; }
+done
+
+TMPDIR="$(mktemp -d)"
+cleanup() { rm -rf "$TMPDIR"; }
+trap cleanup EXIT
+
+# ---- Choose preferred package format ----
+# Linux: prefer native package manager if possible
+PKG_EXT=""
+if [[ "$K9S_OS" == "linux" ]]; then
+  if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1 || command -v zypper >/dev/null 2>&1; then
+    PKG_EXT="rpm"
+  elif command -v apt-get >/dev/null 2>&1 || command -v dpkg >/dev/null 2>&1; then
+    PKG_EXT="deb"
+  fi
 fi
 
-# ---- get latest asset url (jq if available) ----
+# ---- Fetch latest release metadata ----
 API="https://api.github.com/repos/${REPO}/releases/latest"
-JSON="$(fetch "$API")"
+JSON="$(curl -fsSL "$API")"
 
-pick_url_jq() {
-  local ext="$1"
-  jq -r --arg os "$OS" --arg arch "$ARCH" --arg ext "$ext" '
-    .assets[]
-    | select(.name == ("k9s_" + $os + "_" + $arch + "." + $ext))
-    | .browser_download_url
-  ' <<<"$JSON" | head -n 1
-}
-
-pick_url_grep() {
-  local ext="$1"
-  echo "$JSON" \
-    | grep -Eo '"browser_download_url":[^"]*"https:[^"]+"' \
-    | sed -E 's/^"browser_download_url":[^"]*"//; s/"$//' \
-    | grep -E "k9s_${OS}_${ARCH}\.${ext}$" \
-    | head -n 1
-}
-
+# Prefer jq if available, else fallback to grep/sed extraction
 pick_url() {
   local ext="$1"
-  if need jq; then pick_url_jq "$ext"
-  else pick_url_grep "$ext"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg os "$K9S_OS" --arg arch "$K9S_ARCH" --arg ext "$ext" '
+      .assets[]
+      | select(.name == ("k9s_" + $os + "_" + $arch + "." + $ext))
+      | .browser_download_url
+    ' <<<"$JSON" | head -n 1
+  else
+    echo "$JSON" \
+      | grep -Eo '"browser_download_url":[^"]*"https:[^"]+"' \
+      | sed -E 's/^"browser_download_url":[^"]*"//; s/"$//' \
+      | grep -E "k9s_${K9S_OS}_${K9S_ARCH}\.${ext}$" \
+      | head -n 1
   fi
 }
 
 URL=""
-if [[ -n "$PKG" ]]; then
-  URL="$(pick_url "$PKG" || true)"
+if [[ -n "$PKG_EXT" ]]; then
+  URL="$(pick_url "$PKG_EXT" || true)"
 fi
 if [[ -z "$URL" ]]; then
   URL="$(pick_url "tar.gz" || true)"
 fi
 
 if [[ -z "$URL" ]]; then
-  echo "ERROR: No asset found for ${OS}/${ARCH}." >&2
-  echo "Check: https://github.com/${REPO}/releases/latest" >&2
+  echo "[ERROR] No suitable release asset found for ${K9S_OS}/${K9S_ARCH}" >&2
+  echo "        Check: https://github.com/${REPO}/releases/latest" >&2
   exit 1
 fi
 
-echo "Selected: $URL"
+echo "[INFO] Selected asset: $URL"
 
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT
-
-# ---- install ----
+# ---- Download & install ----
 if [[ "$URL" == *.rpm ]]; then
   FILE="$TMPDIR/k9s.rpm"
-  download_to "$URL" "$FILE"
+  curl -fL "$URL" -o "$FILE"
 
-  if need dnf; then
+  if command -v dnf >/dev/null 2>&1; then
     sudo dnf -y install "$FILE"
-  elif need yum; then
+  elif command -v yum >/dev/null 2>&1; then
     sudo yum -y localinstall "$FILE" || sudo yum -y install "$FILE"
-  elif need zypper; then
+  elif command -v zypper >/dev/null 2>&1; then
     sudo zypper --non-interactive install "$FILE"
   else
-    # last resort: rpm (deps not handled)
     sudo rpm -Uvh --replacepkgs "$FILE"
   fi
 
 elif [[ "$URL" == *.deb ]]; then
   FILE="$TMPDIR/k9s.deb"
-  download_to "$URL" "$FILE"
+  curl -fL "$URL" -o "$FILE"
 
   sudo dpkg -i "$FILE" || true
-  if need apt-get; then
-    sudo apt-get -y -f install
-    sudo dpkg -i "$FILE"
-  else
-    echo "ERROR: dpkg install failed and apt-get not found." >&2
-    exit 1
-  fi
+  sudo apt-get -y -f install
+  sudo dpkg -i "$FILE"
 
 else
   FILE="$TMPDIR/k9s.tar.gz"
-  download_to "$URL" "$FILE"
+  curl -fL "$URL" -o "$FILE"
+
   tar -xzf "$FILE" -C "$TMPDIR"
 
   BIN="$(find "$TMPDIR" -maxdepth 2 -type f -name k9s | head -n 1 || true)"
-  [[ -n "$BIN" && -f "$BIN" ]] || { echo "ERROR: k9s binary not found in tar." >&2; exit 1; }
+  [[ -n "$BIN" && -f "$BIN" ]] || { echo "[ERROR] k9s binary not found in tarball" >&2; exit 1; }
 
   sudo install -m 0755 "$BIN" /usr/local/bin/k9s
 fi
 
-echo "Installed: $(command -v k9s)"
+echo "[INFO] Installed: $(command -v k9s)"
 k9s version || true
